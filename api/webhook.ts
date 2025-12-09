@@ -259,17 +259,27 @@ function setupBotHandlers(bot: Telegraf, sheetsClient: any, spreadsheetId: strin
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
-  }
+  // Telegram requires 200 OK response immediately, even if processing fails
+  // So we send the response first, then process the update
+  res.status(200).json({ ok: true });
 
+  // Now process the update asynchronously
   try {
     const botInstance = initializeBot();
     await botInstance.handleUpdate(req.body);
-    return res.status(200).json({ ok: true });
   } catch (error: any) {
-    console.error('Webhook error:', error);
-    return res.status(500).json({ error: error.message });
+    // Log errors but don't fail the webhook response
+    // Telegram already got 200 OK, so it won't retry
+    console.error('Webhook processing error:', error);
+    console.error('Error details:', {
+      message: error.message,
+      stack: error.stack,
+      envVars: {
+        hasToken: !!process.env.TELEGRAM_BOT_TOKEN,
+        hasSheetsId: !!process.env.GOOGLE_SHEETS_ID,
+        hasServiceAccount: !!process.env.GOOGLE_SERVICE_ACCOUNT,
+      }
+    });
   }
 }
 
