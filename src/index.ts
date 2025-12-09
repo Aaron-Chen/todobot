@@ -203,6 +203,67 @@ async function addTodoToTable(username: string, text: string): Promise<void> {
 }
 
 /**
+ * Lists all todos for a user that are not done
+ * Returns formatted string with numbered list
+ */
+async function listTodos(username: string): Promise<string> {
+  const startRow = USERNAME_TO_TABLE_START[username];
+  if (!startRow) {
+    throw new Error(`Unknown username: @${username}. Supported usernames: ${Object.keys(USERNAME_TO_TABLE_START).map(u => `@${u}`).join(', ')}`);
+  }
+
+  const sheetTitle = await getLeftmostSheetTitle();
+  const endRow = getTableEndRow(username);
+  
+  // Read columns B (Purpose), C (Goal), and D (Status)
+  // We'll check column D for status, but handle cases where it might not exist
+  const range = `${sheetTitle}!B${startRow}:D${endRow}`;
+  
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: GOOGLE_SHEETS_ID,
+    range,
+  });
+
+  const values = res.data.values || [];
+  const todos: Array<{ purpose: string; goal: string }> = [];
+  
+  // Filter tasks that are not done
+  for (let i = 0; i < values.length; i++) {
+    const row = values[i];
+    if (!row || row.length === 0) continue;
+    
+    const purpose = row[0]?.trim() || '';
+    const goal = row[1]?.trim() || '';
+    const status = (row[2]?.trim() || '').toLowerCase();
+    
+    // Skip empty rows
+    if (!purpose) continue;
+    
+    // Skip tasks marked as "done" (case-insensitive)
+    if (status === 'done') continue;
+    
+    todos.push({ purpose, goal });
+  }
+  
+  // Format as numbered list
+  if (todos.length === 0) {
+    return `📋 No pending tasks for @${username}`;
+  }
+  
+  let message = `📋 Tasks for @${username}:\n\n`;
+  todos.forEach((todo, index) => {
+    const number = index + 1;
+    if (todo.goal) {
+      message += `${number}. ${todo.purpose} (${todo.goal})\n`;
+    } else {
+      message += `${number}. ${todo.purpose}\n`;
+    }
+  });
+  
+  return message.trim();
+}
+
+/**
  * Helper function to handle adding todos (shared by /do, /he, /aaron commands)
  */
 async function handleTodoCommand(ctx: any, username: string, text: string) {
@@ -321,6 +382,53 @@ bot.command('aaron', async (ctx) => {
   } catch (error: any) {
     console.error('Error adding todo:', error);
     const errorMessage = error.message || 'Failed to add todo. Check logs for details.';
+    await ctx.reply(`❌ ${errorMessage}`);
+  }
+});
+
+// Register /list command handler
+bot.command('list', async (ctx) => {
+  try {
+    const commandText = ctx.message.text || '';
+    const argsText = commandText.replace(/^\/list\s*/i, '').trim();
+    
+    let username: string;
+    
+    // If no argument, try to detect user from Telegram username
+    if (!argsText) {
+      const telegramUsername = ctx.from?.username;
+      if (telegramUsername && USERNAME_TO_TABLE_START[telegramUsername]) {
+        username = telegramUsername;
+      } else {
+        await ctx.reply('Usage: /list [@username]\nExample: /list @hesong07\nOr: /list @boewu28\nOr: /list (to see your own list if you\'re registered)');
+        return;
+      }
+    } else {
+      // Check if user specified a username or shortcut
+      const usernameMatch = argsText.match(/^@?(\w+)/);
+      if (usernameMatch) {
+        const inputUsername = usernameMatch[1].toLowerCase();
+        
+        // Check if it's a shortcut
+        if (SHORTCUT_TO_USERNAME[inputUsername]) {
+          username = SHORTCUT_TO_USERNAME[inputUsername];
+        } else if (USERNAME_TO_TABLE_START[inputUsername]) {
+          username = inputUsername;
+        } else {
+          await ctx.reply(`❌ Unknown username: @${inputUsername}\nSupported: @hesong07, @boewu28, or shortcuts: he, aaron`);
+          return;
+        }
+      } else {
+        await ctx.reply('Usage: /list [@username]\nExample: /list @hesong07\nOr: /list he\nOr: /list aaron');
+        return;
+      }
+    }
+    
+    const listMessage = await listTodos(username);
+    await ctx.reply(listMessage);
+  } catch (error: any) {
+    console.error('Error listing todos:', error);
+    const errorMessage = error.message || 'Failed to list todos. Check logs for details.';
     await ctx.reply(`❌ ${errorMessage}`);
   }
 });
