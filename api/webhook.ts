@@ -260,26 +260,45 @@ function setupBotHandlers(bot: Telegraf, sheetsClient: any, spreadsheetId: strin
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   // Telegram requires 200 OK response immediately, even if processing fails
-  // So we send the response first, then process the update
-  res.status(200).json({ ok: true });
-
-  // Now process the update asynchronously
   try {
-    const botInstance = initializeBot();
-    await botInstance.handleUpdate(req.body);
-  } catch (error: any) {
-    // Log errors but don't fail the webhook response
-    // Telegram already got 200 OK, so it won't retry
-    console.error('Webhook processing error:', error);
-    console.error('Error details:', {
-      message: error.message,
-      stack: error.stack,
-      envVars: {
-        hasToken: !!process.env.TELEGRAM_BOT_TOKEN,
-        hasSheetsId: !!process.env.GOOGLE_SHEETS_ID,
-        hasServiceAccount: !!process.env.GOOGLE_SERVICE_ACCOUNT,
+    // Immediately send 200 OK to Telegram - this is critical!
+    res.status(200).json({ ok: true });
+    
+    // Process the update asynchronously (don't await - let it run in background)
+    // This ensures Telegram gets the response immediately
+    setImmediate(async () => {
+      try {
+        if (!req.body) {
+          console.error('No request body received');
+          return;
+        }
+        
+        const botInstance = initializeBot();
+        await botInstance.handleUpdate(req.body);
+      } catch (error: any) {
+        // Log errors but don't fail the webhook response
+        // Telegram already got 200 OK, so it won't retry
+        console.error('Webhook processing error:', error);
+        console.error('Error details:', {
+          message: error.message,
+          stack: error.stack,
+          envVars: {
+            hasToken: !!process.env.TELEGRAM_BOT_TOKEN,
+            hasSheetsId: !!process.env.GOOGLE_SHEETS_ID,
+            hasServiceAccount: !!process.env.GOOGLE_SERVICE_ACCOUNT,
+          }
+        });
       }
     });
+  } catch (error: any) {
+    // If even sending the response fails, log it but still try to send 200
+    console.error('Critical error in webhook handler:', error);
+    try {
+      res.status(200).json({ ok: true });
+    } catch (e) {
+      // Last resort - if we can't send response, log it
+      console.error('Failed to send response to Telegram:', e);
+    }
   }
 }
 
