@@ -40,12 +40,11 @@ const sheets = google.sheets({ version: 'v4', auth });
 // Create Telegraf bot
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 
-// Username to table start row mapping
-// HE_3 table: starts at row 4, data starts at row 6
-// AARON_3 table: starts at row 22, data starts at row 24
-const USERNAME_TO_TABLE_START: Record<string, number> = {
-  'hesong07': 6,   // HE_3 table data starts at row 6
-  'boewu28': 24,  // AARON_3 table data starts at row 24
+// Username to approximate search range mapping (where to look for header row)
+// These are approximate ranges to search for the "Purpose", "Goal", "Status" header row
+const USERNAME_TO_SEARCH_RANGE: Record<string, { start: number; end: number }> = {
+  'hesong07': { start: 1, end: 20 },   // Search rows 1-20 for He's table header
+  'boewu28': { start: 15, end: 35 },  // Search rows 15-35 for Aaron's table header
 };
 
 // Shortcut commands to username mapping
@@ -55,19 +54,73 @@ const SHORTCUT_TO_USERNAME: Record<string, string> = {
 };
 
 /**
- * Gets the end row for a table (where the next table starts, or a safe limit)
- * Returns the row BEFORE the next table starts, so we don't include the next table's header
+ * Finds the header row containing "Purpose", "Goal", "Status" for a user's table
+ * Returns the row number where the header is found, or throws error if not found
  */
-function getTableEndRow(username: string): number {
-  const startRows = Object.values(USERNAME_TO_TABLE_START).sort((a, b) => a - b);
-  const currentStart = USERNAME_TO_TABLE_START[username];
+async function findHeaderRow(username: string): Promise<number> {
+  const searchRange = USERNAME_TO_SEARCH_RANGE[username];
+  if (!searchRange) {
+    throw new Error(`Unknown username: @${username}. Supported usernames: ${Object.keys(USERNAME_TO_SEARCH_RANGE).map(u => `@${u}`).join(', ')}`);
+  }
+
+  const sheetTitle = await getLeftmostSheetTitle();
   
-  // Find the next table's start row
-  const nextTableStart = startRows.find(row => row > currentStart);
+  // Read columns B, C, D in the search range to find the header row
+  const range = `${sheetTitle}!B${searchRange.start}:D${searchRange.end}`;
   
-  // If there's a next table, stop 2 rows before it (to avoid the header row)
-  // Otherwise, use a safe limit (current + 200)
-  return nextTableStart ? nextTableStart - 2 : currentStart + 200;
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: GOOGLE_SHEETS_ID,
+    range,
+  });
+
+  const values = res.data.values || [];
+  
+  // Look for a row that contains "Purpose", "Goal", and "Status" (case-insensitive)
+  for (let i = 0; i < values.length; i++) {
+    const row = values[i];
+    if (!row || row.length < 3) continue;
+    
+    const colB = (row[0] || '').toString().trim().toLowerCase();
+    const colC = (row[1] || '').toString().trim().toLowerCase();
+    const colD = (row[2] || '').toString().trim().toLowerCase();
+    
+    // Check if this row contains the header keywords
+    if (colB.includes('purpose') && colC.includes('goal') && colD.includes('status')) {
+      const headerRow = searchRange.start + i;
+      console.log(`[DEBUG] Found header row for @${username} at row ${headerRow}`);
+      return headerRow;
+    }
+  }
+  
+  throw new Error(`Could not find header row (Purpose/Goal/Status) for @${username} in range ${searchRange.start}-${searchRange.end}`);
+}
+
+/**
+ * Gets the end row for a table (where the next table starts, or a safe limit)
+ * Uses the header row to determine table boundaries
+ */
+async function getTableEndRow(username: string, headerRow: number): Promise<number> {
+  // Get approximate search ranges for other users to find their headers
+  const otherUsers = Object.keys(USERNAME_TO_SEARCH_RANGE).filter(u => u !== username);
+  let nextTableHeaderRow: number | null = null;
+  
+  // Try to find the next table's header row
+  for (const otherUser of otherUsers) {
+    try {
+      const otherHeaderRow = await findHeaderRow(otherUser);
+      if (otherHeaderRow > headerRow) {
+        if (!nextTableHeaderRow || otherHeaderRow < nextTableHeaderRow) {
+          nextTableHeaderRow = otherHeaderRow;
+        }
+      }
+    } catch (e) {
+      // Ignore errors when searching for other tables
+    }
+  }
+  
+  // If there's a next table, stop 2 rows before its header (to avoid the header row)
+  // Otherwise, use a safe limit (200 rows after header)
+  return nextTableHeaderRow ? nextTableHeaderRow - 2 : headerRow + 200;
 }
 
 /**
@@ -119,24 +172,19 @@ async function findLastDataRow(sheetTitle: string, startRow: number, endRow: num
 
 /**
  * Adds a todo item to the specified user's table
- * Inserts a new row at the first data row position, shifting all existing rows down
+ * Inserts a new row right below the header row (Purpose/Goal/Status), shifting all existing rows down
  * This makes the newest item appear at the top of the table
  */
 async function addTodoToTable(username: string, text: string): Promise<void> {
-  const startRow = USERNAME_TO_TABLE_START[username];
-  if (!startRow) {
-    throw new Error(`Unknown username: @${username}. Supported usernames: ${Object.keys(USERNAME_TO_TABLE_START).map(u => `@${u}`).join(', ')}`);
-  }
-
   const sheetTitle = await getLeftmostSheetTitle();
   
-  console.log(`[DEBUG] Username: ${username}, StartRow: ${startRow}`);
+  // Find the header row dynamically
+  const headerRow = await findHeaderRow(username);
   
-  // The new row will be inserted at the first data row position (startRow)
-  // This will push all existing rows down, making the newest item appear at the top
-  const insertRow = startRow;
+  // Insert right below the header row (headerRow + 1)
+  const insertRow = headerRow + 1;
   
-  console.log(`[DEBUG] Will insert at row: ${insertRow} (top of table)`);
+  console.log(`[DEBUG] Username: ${username}, HeaderRow: ${headerRow}, InsertRow: ${insertRow}`);
 
   // Parse text: if it contains ",", split into purpose and goal
   // Otherwise, use the whole text as purpose and leave goal empty
@@ -203,20 +251,20 @@ async function addTodoToTable(username: string, text: string): Promise<void> {
 }
 
 /**
- * Lists all todos for a user that are not done
- * Returns formatted string with numbered list
+ * Gets todos with their actual row numbers (for marking as done)
+ * Returns array of todos with row numbers
  */
-async function listTodos(username: string): Promise<string> {
-  const startRow = USERNAME_TO_TABLE_START[username];
-  if (!startRow) {
-    throw new Error(`Unknown username: @${username}. Supported usernames: ${Object.keys(USERNAME_TO_TABLE_START).map(u => `@${u}`).join(', ')}`);
-  }
-
+async function getTodosWithRowNumbers(username: string): Promise<Array<{ purpose: string; goal: string; rowNumber: number }>> {
   const sheetTitle = await getLeftmostSheetTitle();
-  const endRow = getTableEndRow(username);
+  
+  // Find the header row dynamically
+  const headerRow = await findHeaderRow(username);
+  const endRow = await getTableEndRow(username, headerRow);
+  
+  // Data starts right after the header row
+  const startRow = headerRow + 1;
   
   // Read columns B (Purpose), C (Goal), and D (Status)
-  // We'll check column D for status, but handle cases where it might not exist
   const range = `${sheetTitle}!B${startRow}:D${endRow}`;
   
   const res = await sheets.spreadsheets.values.get({
@@ -225,7 +273,7 @@ async function listTodos(username: string): Promise<string> {
   });
 
   const values = res.data.values || [];
-  const todos: Array<{ purpose: string; goal: string }> = [];
+  const todos: Array<{ purpose: string; goal: string; rowNumber: number }> = [];
   
   // Filter tasks that are not done
   for (let i = 0; i < values.length; i++) {
@@ -242,8 +290,20 @@ async function listTodos(username: string): Promise<string> {
     // Skip tasks marked as "done" (case-insensitive)
     if (status === 'done') continue;
     
-    todos.push({ purpose, goal });
+    // Calculate actual row number (startRow is 1-based, i is 0-based)
+    const rowNumber = startRow + i;
+    todos.push({ purpose, goal, rowNumber });
   }
+  
+  return todos;
+}
+
+/**
+ * Lists all todos for a user that are not done
+ * Returns formatted string with numbered list
+ */
+async function listTodos(username: string): Promise<string> {
+  const todos = await getTodosWithRowNumbers(username);
   
   // Format as numbered list
   if (todos.length === 0) {
@@ -261,6 +321,27 @@ async function listTodos(username: string): Promise<string> {
   });
   
   return message.trim();
+}
+
+/**
+ * Marks a task as done by updating the Status column
+ */
+async function markTaskAsDone(username: string, rowNumber: number): Promise<void> {
+  const sheetTitle = await getLeftmostSheetTitle();
+  
+  // Update column D (Status) to "done"
+  const range = `${sheetTitle}!D${rowNumber}`;
+  
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: GOOGLE_SHEETS_ID,
+    range,
+    valueInputOption: 'RAW',
+    requestBody: {
+      values: [['done']],
+    },
+  });
+  
+  console.log(`[DEBUG] Marked task at row ${rowNumber} as done for @${username}`);
 }
 
 /**
@@ -314,11 +395,11 @@ bot.command('do', async (ctx) => {
         return;
       }
       
-      // Check if the Telegram username matches a known table username
-      if (!USERNAME_TO_TABLE_START[telegramUsername]) {
-        await ctx.reply(`❌ Your username @${telegramUsername} is not registered. Please use /do @username text instead.`);
-        return;
-      }
+        // Check if the Telegram username matches a known table username
+        if (!USERNAME_TO_SEARCH_RANGE[telegramUsername]) {
+          await ctx.reply(`❌ Your username @${telegramUsername} is not registered. Please use /do @username text instead.`);
+          return;
+        }
       
       username = telegramUsername;
       text = argsText.substring(3).trim(); // Remove "me " prefix
@@ -386,21 +467,21 @@ bot.command('aaron', async (ctx) => {
   }
 });
 
-// Register /list command handler
-bot.command('list', async (ctx) => {
+// Register /done command handler
+bot.command('done', async (ctx) => {
   try {
     const commandText = ctx.message.text || '';
-    const argsText = commandText.replace(/^\/list\s*/i, '').trim();
+    const argsText = commandText.replace(/^\/done\s*/i, '').trim();
     
     let username: string;
     
-    // If no argument, try to detect user from Telegram username
+    // If no argument, try to detect user from Telegram username (self-reflective)
     if (!argsText) {
       const telegramUsername = ctx.from?.username;
-      if (telegramUsername && USERNAME_TO_TABLE_START[telegramUsername]) {
+      if (telegramUsername && USERNAME_TO_SEARCH_RANGE[telegramUsername]) {
         username = telegramUsername;
       } else {
-        await ctx.reply('Usage: /list [@username]\nExample: /list @hesong07\nOr: /list @boewu28\nOr: /list (to see your own list if you\'re registered)');
+        await ctx.reply('❌ Could not determine your username. Please use /done [@username] or /done [shortcut]\nExample: /done @hesong07\nOr: /done he\nOr: /done aaron');
         return;
       }
     } else {
@@ -412,12 +493,83 @@ bot.command('list', async (ctx) => {
         // Check if it's a shortcut
         if (SHORTCUT_TO_USERNAME[inputUsername]) {
           username = SHORTCUT_TO_USERNAME[inputUsername];
-        } else if (USERNAME_TO_TABLE_START[inputUsername]) {
+        } else if (USERNAME_TO_SEARCH_RANGE[inputUsername]) {
           username = inputUsername;
         } else {
           await ctx.reply(`❌ Unknown username: @${inputUsername}\nSupported: @hesong07, @boewu28, or shortcuts: he, aaron`);
           return;
         }
+      } else {
+        await ctx.reply('Usage: /done [@username]\nExample: /done @hesong07\nOr: /done he\nOr: /done aaron\nOr: /done (for your own list)');
+        return;
+      }
+    }
+    
+    const todos = await getTodosWithRowNumbers(username);
+    
+    if (todos.length === 0) {
+      await ctx.reply(`📋 No pending tasks for @${username}`);
+      return;
+    }
+    
+    // Show all tasks
+    let message = `📋 Tasks for @${username}:\n\n`;
+    todos.forEach((todo, index) => {
+      const number = index + 1;
+      if (todo.goal) {
+        message += `${number}. ${todo.purpose} (${todo.goal})\n`;
+      } else {
+        message += `${number}. ${todo.purpose}\n`;
+      }
+    });
+    
+    // Add inline keyboard with "Mark as done" button
+    await ctx.reply(message, {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: 'Mark as done', callback_data: `mark_done:${username}:show_list` }]
+        ]
+      }
+    });
+  } catch (error: any) {
+    console.error('Error in /done command:', error);
+    const errorMessage = error.message || 'Failed to list todos. Check logs for details.';
+    await ctx.reply(`❌ ${errorMessage}`);
+  }
+});
+
+// Register /list command handler
+bot.command('list', async (ctx) => {
+  try {
+    const commandText = ctx.message.text || '';
+    const argsText = commandText.replace(/^\/list\s*/i, '').trim();
+    
+    let username: string;
+    
+    // If no argument, try to detect user from Telegram username
+    if (!argsText) {
+      const telegramUsername = ctx.from?.username;
+      if (telegramUsername && USERNAME_TO_SEARCH_RANGE[telegramUsername]) {
+        username = telegramUsername;
+      } else {
+        await ctx.reply('Usage: /list [@username]\nExample: /list @hesong07\nOr: /list @boewu28\nOr: /list (to see your own list if you\'re registered)');
+        return;
+      }
+    } else {
+      // Check if user specified a username or shortcut
+      const usernameMatch = argsText.match(/^@?(\w+)/);
+      if (usernameMatch) {
+        const inputUsername = usernameMatch[1].toLowerCase();
+        
+          // Check if it's a shortcut
+          if (SHORTCUT_TO_USERNAME[inputUsername]) {
+            username = SHORTCUT_TO_USERNAME[inputUsername];
+          } else if (USERNAME_TO_SEARCH_RANGE[inputUsername]) {
+            username = inputUsername;
+          } else {
+            await ctx.reply(`❌ Unknown username: @${inputUsername}\nSupported: @hesong07, @boewu28, or shortcuts: he, aaron`);
+            return;
+          }
       } else {
         await ctx.reply('Usage: /list [@username]\nExample: /list @hesong07\nOr: /list he\nOr: /list aaron');
         return;
@@ -430,6 +582,72 @@ bot.command('list', async (ctx) => {
     console.error('Error listing todos:', error);
     const errorMessage = error.message || 'Failed to list todos. Check logs for details.';
     await ctx.reply(`❌ ${errorMessage}`);
+  }
+});
+
+// Handle callback queries (button clicks)
+bot.on('callback_query', async (ctx) => {
+  try {
+    if (!('data' in ctx.callbackQuery)) return;
+    const data = ctx.callbackQuery.data;
+    if (!data) return;
+    
+    // Handle "Mark as done" button - show list of tasks
+    if (data.startsWith('mark_done:')) {
+      const parts = data.split(':');
+      if (parts.length === 3 && parts[2] === 'show_list') {
+        const username = parts[1];
+        const todos = await getTodosWithRowNumbers(username);
+        
+        if (todos.length === 0) {
+          await ctx.answerCbQuery('No pending tasks to mark as done');
+          await ctx.editMessageText('📋 No pending tasks to mark as done');
+          return;
+        }
+        
+        // Create inline keyboard with numbered buttons
+        const buttons = todos.map((todo, index) => {
+          const number = index + 1;
+          const label = todo.goal 
+            ? `${number}. ${todo.purpose.substring(0, 30)}...` 
+            : `${number}. ${todo.purpose.substring(0, 30)}${todo.purpose.length > 30 ? '...' : ''}`;
+          return [{ text: label, callback_data: `mark_done:${username}:${todo.rowNumber}` }];
+        });
+        
+        let message = `Select a task to mark as done:\n\n`;
+        todos.forEach((todo, index) => {
+          const number = index + 1;
+          if (todo.goal) {
+            message += `${number}. ${todo.purpose} (${todo.goal})\n`;
+          } else {
+            message += `${number}. ${todo.purpose}\n`;
+          }
+        });
+        
+        await ctx.answerCbQuery();
+        await ctx.editMessageText(message, {
+          reply_markup: {
+            inline_keyboard: buttons
+          }
+        });
+        return;
+      }
+      
+      // Handle selecting a specific task to mark as done
+      if (parts.length === 3 && !isNaN(parseInt(parts[2]))) {
+        const username = parts[1];
+        const rowNumber = parseInt(parts[2]);
+        
+        await markTaskAsDone(username, rowNumber);
+        
+        await ctx.answerCbQuery('Task marked as done! ✅');
+        await ctx.editMessageText('✅ Task marked as done!');
+        return;
+      }
+    }
+  } catch (error: any) {
+    console.error('Error handling callback query:', error);
+    await ctx.answerCbQuery('An error occurred');
   }
 });
 
